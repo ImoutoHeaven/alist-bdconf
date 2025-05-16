@@ -43,8 +43,8 @@ func (d *BaiduNetdisk) GetAddition() driver.Additional {
 
 func (d *BaiduNetdisk) Init(ctx context.Context) error {
 	d.uploadThread, _ = strconv.Atoi(d.UploadThread)
-	if d.uploadThread < 1 || d.uploadThread > 32 {
-		d.uploadThread, d.UploadThread = 3, "3"
+	if d.uploadThread < 1 || d.uploadThread > 100 {
+		d.uploadThread, d.UploadThread = 50, "50"
 	}
 
 	if _, err := url.Parse(d.UploadAPI); d.UploadAPI == "" || err != nil {
@@ -294,10 +294,10 @@ func (d *BaiduNetdisk) Put(ctx context.Context, dstDir model.Obj, stream model.F
 	}
 	// step.2 上传分片
 	threadG, upCtx := errgroup.NewGroupWithContext(ctx, d.uploadThread,
-		retry.Attempts(1),
+		retry.Attempts(10),  // 修改：从1次改为10次重试
 		retry.Delay(time.Second),
-		retry.DelayType(retry.BackOffDelay))
-	sem := semaphore.NewWeighted(3)
+		retry.DelayType(retry.FixedDelay))  // 修改：从BackOffDelay改为FixedDelay
+	sem := semaphore.NewWeighted(50)  // 修改：从3改为50
 	for i, partseq := range precreateResp.BlockList {
 		if utils.IsCanceled(upCtx) {
 			break
