@@ -30,7 +30,7 @@ type BaiduNetdisk struct {
 	Addition
 
 	uploadThread int
-	vipType      int // 会员类型，0普通用户(4G/4M)、1普通会员(10G/16M)、2超级会员(20G/32M)
+	vipType      int // 会员类型，0普通用户(4G/4M)、1普通会员(10G/16M)、2超级会员(20G/32M) 
 }
 
 func (d *BaiduNetdisk) Config() driver.Config {
