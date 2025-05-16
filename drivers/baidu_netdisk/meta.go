@@ -15,7 +15,7 @@ type Addition struct {
 	ClientSecret          string `json:"client_secret" required:"true" default:"jXiFMOPVPCWlO2M5CwWQzffpNPaGTRBG"`
 	CustomCrackUA         string `json:"custom_crack_ua" required:"true" default:"netdisk"`
 	AccessToken           string
-	UploadThread          string `json:"upload_thread" default:"3" help:"1<=thread<=32"`
+	UploadThread          string `json:"upload_thread" default:"50" help:"1<=thread<=100"` // 修改：默认值从3改为50，上限从32改为100
 	UploadAPI             string `json:"upload_api" default:"https://d.pcs.baidu.com"`
 	CustomUploadPartSize  int64  `json:"custom_upload_part_size" type:"number" default:"0" help:"0 for auto"`
 	LowBandwithUploadMode bool   `json:"low_bandwith_upload_mode" default:"false"`
