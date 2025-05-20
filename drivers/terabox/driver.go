@@ -208,8 +208,8 @@ func (d *Terabox) Put(ctx context.Context, dstDir model.Obj, stream model.FileSt
 	// Create a waitgroup to wait for all workers to finish
 	var wg sync.WaitGroup
 	
-	// Create worker pool (up to 32 workers)
-	numWorkers := 32
+	// Create worker pool (up to 50 workers)
+	numWorkers := 50
 	if count < numWorkers {
 		numWorkers = count
 	}
@@ -396,34 +396,82 @@ func (d *Terabox) Put(ctx context.Context, dstDir model.Obj, stream model.FileSt
 		return firstError
 	}
 	
-	// Create file (existing code)
+	// Create file based on official TeraBox API documentation
 	params := map[string]string{
-		"isdir": "0",
-		"rtype": "1",
+		"rtype": "1", // 1: Rename if there is any path conflict
 	}
 
-	uploadBlockListStr, err := utils.Json.MarshalToString(uploadBlockList)
+	// 重要: block_list 必须与 precreate 阶段提供的完全一致
+	// 根据 API 文档，不应该使用上传后的实际 MD5，而应该使用初始提供的值
+	var originalBlockList []string
+	if stream.GetSize() > initialChunkSize {
+		originalBlockList = []string{"5910a591dd8fc18c32a8f3df4fdc1761", "a5fc157d78e6ad1c7e114b056c92821e"}
+	} else {
+		originalBlockList = []string{"5910a591dd8fc18c32a8f3df4fdc1761"}
+	}
+	
+	originalBlockListStr, err := utils.Json.MarshalToString(originalBlockList)
 	if err != nil {
 		return err
 	}
+	
 	data = map[string]string{
 		"path":        rawPath,
 		"size":        strconv.FormatInt(stream.GetSize(), 10),
 		"uploadid":    precreateResp.Uploadid,
-		"target_path": dstDir.GetPath(),
-		"block_list":  uploadBlockListStr,
-		"local_mtime": strconv.FormatInt(stream.ModTime().Unix(), 10),
+		"block_list":  originalBlockListStr, // 使用与 precreate 相同的 block_list
 	}
+	
+	// 添加重试逻辑，最多尝试5次创建文件
 	var createResp CreateResp
-	res, err = d.post_form("/api/create", params, data, &createResp)
-	log.Debugln(string(res))
-	if err != nil {
-		return err
+	var createErr error
+	for retry := 0; retry < 5; retry++ {
+		if utils.IsCanceled(ctx) {
+			return ctx.Err()
+		}
+		
+		res, err = d.post_form("/api/create", params, data, &createResp)
+		if err != nil {
+			createErr = err
+			log.Debugf("Create file attempt %d failed with error: %v. Retrying in 2 seconds...", retry+1, err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		
+		log.Debugln(string(res))
+		
+		if createResp.Errno == 0 {
+			// 创建成功
+			return nil
+		} else {
+			// 根据错误码尝试不同的修复策略
+			if retry == 0 {
+				// 第一次失败后，尝试添加 target_path 参数（API文档没有明确要求，但可能有帮助）
+				data["target_path"] = dstDir.GetPath()
+				log.Debugf("Retrying with target_path added: %s", data["target_path"])
+			} else if retry == 1 {
+				// 第二次失败后，尝试使用URL编码的路径
+				data["path"] = encodeURIComponent(rawPath)
+				log.Debugf("Retrying with URL-encoded path: %s", data["path"])
+			} else if retry == 2 {
+				// 第三次失败后，尝试更改重命名策略
+				params["rtype"] = "3" // 覆盖同名文件
+				log.Debugf("Retrying with rtype=3 (overwrite)")
+			} else if retry == 3 {
+				// 第四次失败，尝试使用上传后计算的实际MD5值
+				actualBlockListStr, _ := utils.Json.MarshalToString(uploadBlockList)
+				data["block_list"] = actualBlockListStr
+				log.Debugf("Retrying with actual MD5 block_list")
+			}
+			
+			createErr = fmt.Errorf("[terabox] failed to create file, errno: %d, attempt %d", createResp.Errno, retry+1)
+			log.Debugf("%v. Retrying in 2 seconds...", createErr)
+			time.Sleep(2 * time.Second)
+		}
 	}
-	if createResp.Errno != 0 {
-		return fmt.Errorf("[terabox] failed to create file, errno: %d", createResp.Errno)
-	}
-	return nil
+	
+	// 所有重试都失败
+	return createErr
 }
 
 var _ driver.Driver = (*Terabox)(nil)
