@@ -10,10 +10,15 @@ import (
 	"math"
 	stdpath "path"
 	"strconv"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/alist-org/alist/v3/drivers/base"
 	"github.com/alist-org/alist/v3/pkg/utils"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/semaphore"
 
 	"github.com/alist-org/alist/v3/internal/driver"
 	"github.com/alist-org/alist/v3/internal/model"
@@ -177,71 +182,138 @@ func (d *Terabox) Put(ctx context.Context, dstDir model.Obj, stream model.FileSt
 		return nil
 	}
 
-	// upload chunks
+	// 缓存完整文件
 	tempFile, err := stream.CacheFullInTempFile()
 	if err != nil {
 		return err
 	}
 
-	params := map[string]string{
-		"method":     "upload",
-		"path":       path,
-		"uploadid":   precreateResp.Uploadid,
-		"app_id":     "250528",
-		"web":        "1",
-		"channel":    "dubox",
-		"clienttype": "0",
-	}
-
+	// 基本参数设置
 	streamSize := stream.GetSize()
 	chunkSize := calculateChunkSize(streamSize)
-	chunkByteData := make([]byte, chunkSize)
 	count := int(math.Ceil(float64(streamSize) / float64(chunkSize)))
-	left := streamSize
-	uploadBlockList := make([]string, 0, count)
-	h := md5.New()
+
+	// 准备并发上传
+	uploadBlockList := make([]string, count)
+	uploadedChunks := make([]int32, count)
+	
+	// 创建错误组和并发控制
+	eg, uploadCtx := errgroup.WithContext(ctx)
+	sem := semaphore.NewWeighted(100) // 设置100并发
+	
+	// 计算最终的MD5列表互斥锁
+	var blockListMutex sync.Mutex
+	
+	// 启动并发上传任务
 	for partseq := 0; partseq < count; partseq++ {
-		if utils.IsCanceled(ctx) {
-			return ctx.Err()
+		if utils.IsCanceled(uploadCtx) {
+			return uploadCtx.Err()
 		}
-		byteSize := chunkSize
-		var byteData []byte
-		if left >= chunkSize {
-			byteData = chunkByteData
-		} else {
-			byteSize = left
-			byteData = make([]byte, byteSize)
+		
+		partseq := partseq // 创建本地变量避免闭包问题
+		offset := int64(partseq) * chunkSize
+		size := chunkSize
+		if partseq == count-1 && streamSize%chunkSize != 0 {
+			size = streamSize % chunkSize
 		}
-		left -= byteSize
-		_, err = io.ReadFull(tempFile, byteData)
-		if err != nil {
-			return err
-		}
-
-		// calculate md5
-		h.Write(byteData)
-		uploadBlockList = append(uploadBlockList, hex.EncodeToString(h.Sum(nil)))
-		h.Reset()
-
-		u := "https://" + locateupload_resp.Host + "/rest/2.0/pcs/superfile2"
-		params["partseq"] = strconv.Itoa(partseq)
-		res, err := base.RestyClient.R().
-			SetContext(ctx).
-			SetQueryParams(params).
-			SetFileReader("file", stream.GetName(), driver.NewLimitedUploadStream(ctx, bytes.NewReader(byteData))).
-			SetHeader("Cookie", d.Cookie).
-			Post(u)
-		if err != nil {
-			return err
-		}
-		log.Debugln(res.String())
-		if count > 0 {
-			up(float64(partseq) * 100 / float64(count))
-		}
+		
+		eg.Go(func() error {
+			// 获取并发信号量
+			if err := sem.Acquire(uploadCtx, 1); err != nil {
+				return err
+			}
+			defer sem.Release(1)
+			
+			// 添加重试逻辑
+			var uploadErr error
+			for attempt := 0; attempt < 10; attempt++ { // 最多重试10次
+				if utils.IsCanceled(uploadCtx) {
+					return uploadCtx.Err()
+				}
+				
+				// 读取分块数据
+				byteData := make([]byte, size)
+				_, err := tempFile.ReadAt(byteData, offset)
+				if err != nil && err != io.EOF {
+					return err
+				}
+				
+				// 计算MD5
+				h := md5.New()
+				h.Write(byteData)
+				md5sum := hex.EncodeToString(h.Sum(nil))
+				
+				// 设置上传参数
+				u := "https://" + locateupload_resp.Host + "/rest/2.0/pcs/superfile2"
+				params := map[string]string{
+					"method":     "upload",
+					"path":       path,
+					"uploadid":   precreateResp.Uploadid,
+					"app_id":     "250528",
+					"web":        "1",
+					"channel":    "dubox",
+					"clienttype": "0",
+					"partseq":    strconv.Itoa(partseq),
+				}
+				
+				// 执行上传
+				res, err := base.RestyClient.R().
+					SetContext(uploadCtx).
+					SetQueryParams(params).
+					SetFileReader("file", stream.GetName(), driver.NewLimitedUploadStream(uploadCtx, bytes.NewReader(byteData))).
+					SetHeader("Cookie", d.Cookie).
+					Post(u)
+				
+				if err == nil {
+					log.Debugln("分块上传响应:", res.String())
+					// 检查响应状态
+					statusCode := res.StatusCode()
+					errNo := utils.Json.Get(res.Body(), "errno").ToInt()
+					
+					if statusCode == 200 && (errNo == 0 || errNo == 9 || res.String() == "") {
+						// 上传成功
+						atomic.StoreInt32(&uploadedChunks[partseq], 1)
+						
+						// 更新MD5列表
+						blockListMutex.Lock()
+						uploadBlockList[partseq] = md5sum
+						blockListMutex.Unlock()
+						
+						// 更新进度
+						completedChunks := 0
+						for i := 0; i < count; i++ {
+							if atomic.LoadInt32(&uploadedChunks[i]) == 1 {
+								completedChunks++
+							}
+						}
+						up(float64(completedChunks) * 100 / float64(count))
+						
+						return nil // 成功退出重试循环
+					}
+					
+					uploadErr = fmt.Errorf("块%d上传失败(尝试%d/10), errno: %d, 响应: %s", 
+						partseq, attempt+1, errNo, res.String())
+				} else {
+					uploadErr = fmt.Errorf("块%d上传失败(尝试%d/10): %v", 
+						partseq, attempt+1, err)
+				}
+				
+				// 失败则休眠后重试
+				log.Debugf("%v", uploadErr)
+				time.Sleep(time.Second)
+			}
+			
+			return uploadErr // 返回最后一次尝试的错误
+		})
+	}
+	
+	// 等待所有上传任务完成
+	if err := eg.Wait(); err != nil {
+		return err
 	}
 
-	// create file
-	params = map[string]string{
+	// 创建文件
+	params := map[string]string{
 		"isdir": "0",
 		"rtype": "1",
 	}
@@ -250,6 +322,7 @@ func (d *Terabox) Put(ctx context.Context, dstDir model.Obj, stream model.FileSt
 	if err != nil {
 		return err
 	}
+	
 	data = map[string]string{
 		"path":        rawPath,
 		"size":        strconv.FormatInt(stream.GetSize(), 10),
