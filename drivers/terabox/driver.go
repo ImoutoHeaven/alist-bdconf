@@ -10,8 +10,6 @@ import (
 	"math"
 	stdpath "path"
 	"strconv"
-	"sync"
-	"time"
 
 	"github.com/alist-org/alist/v3/drivers/base"
 	"github.com/alist-org/alist/v3/pkg/utils"
@@ -131,7 +129,6 @@ func (d *Terabox) Remove(ctx context.Context, obj model.Obj) error {
 }
 
 func (d *Terabox) Put(ctx context.Context, dstDir model.Obj, stream model.FileStreamer, up driver.UpdateProgress) error {
-	// 1. 获取上传服务器地址 - 保持TeraBox原有逻辑
 	resp, err := base.RestyClient.R().
 		SetContext(ctx).
 		Get("https://" + d.url_domain_prefix + "-data.terabox.com/rest/2.0/pcs/file?method=locateupload")
@@ -146,68 +143,22 @@ func (d *Terabox) Put(ctx context.Context, dstDir model.Obj, stream model.FileSt
 	}
 	log.Debugln(locateupload_resp)
 
-	// 2. 计算每个分片的MD5 - 参考百度网盘逻辑
-	tempFile, err := stream.CacheFullInTempFile()
-	if err != nil {
-		return err
-	}
-	
-	streamSize := stream.GetSize()
-	chunkSize := calculateChunkSize(streamSize)
-	count := int(math.Ceil(float64(streamSize) / float64(chunkSize)))
-	
-	// 预计算所有分片的MD5
-	blockList := make([]string, 0, count)
-	h := md5.New()
-	buffer := make([]byte, chunkSize)
-	
-	_, err = tempFile.Seek(0, io.SeekStart)
-	if err != nil {
-		return err
-	}
-	
-	for i := 0; i < count; i++ {
-		size := chunkSize
-		if i == count-1 {
-			remainingSize := streamSize - int64(i)*chunkSize
-			if remainingSize < chunkSize {
-				size = remainingSize
-			}
-		}
-		
-		buffer = buffer[:size] // 调整buffer大小
-		_, err = io.ReadFull(tempFile, buffer)
-		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-			return err
-		}
-		
-		h.Reset()
-		h.Write(buffer)
-		md5sum := hex.EncodeToString(h.Sum(nil))
-		blockList = append(blockList, md5sum)
-	}
-	
-	// 将MD5列表转为JSON字符串
-	blockListStr, err := utils.Json.MarshalToString(blockList)
-	if err != nil {
-		return err
-	}
-	
-	// 3. 重新定位文件开始位置
-	_, err = tempFile.Seek(0, io.SeekStart)
-	if err != nil {
-		return err
-	}
-	
-	// 4. precreate文件 - 保持TeraBox原有API路径和参数
+	// precreate file
 	rawPath := stdpath.Join(dstDir.GetPath(), stream.GetName())
 	path := encodeURIComponent(rawPath)
-	
+
+	var precreateBlockListStr string
+	if stream.GetSize() > initialChunkSize {
+		precreateBlockListStr = `["5910a591dd8fc18c32a8f3df4fdc1761","a5fc157d78e6ad1c7e114b056c92821e"]`
+	} else {
+		precreateBlockListStr = `["5910a591dd8fc18c32a8f3df4fdc1761"]`
+	}
+
 	data := map[string]string{
 		"path":                  rawPath,
 		"autoinit":              "1",
 		"target_path":           dstDir.GetPath(),
-		"block_list":            blockListStr, // 使用预计算的MD5列表
+		"block_list":            precreateBlockListStr,
 		"local_mtime":           strconv.FormatInt(stream.ModTime().Unix(), 10),
 		"file_limit_switch_v34": "true",
 	}
@@ -225,217 +176,98 @@ func (d *Terabox) Put(ctx context.Context, dstDir model.Obj, stream model.FileSt
 	if precreateResp.ReturnType == 2 {
 		return nil
 	}
-	
-	// 5. 并行上传分片 - 参考百度网盘并行上传思路，保持TeraBox参数
-	type chunkJob struct {
-		partseq int
-		offset  int64
-		size    int64
+
+	// upload chunks
+	tempFile, err := stream.CacheFullInTempFile()
+	if err != nil {
+		return err
 	}
-	
-	type chunkResult struct {
-		partseq int
-		err     error
-	}
-	
-	jobChan := make(chan chunkJob, count)
-	resultChan := make(chan chunkResult, count)
-	
-	var wg sync.WaitGroup
-	
-	// 创建50个worker，参考百度网盘实现
-	numWorkers := 50
-	if count < numWorkers {
-		numWorkers = count
-	}
-	
-	fileMutex := &sync.Mutex{}
-	
-	for i := 0; i < numWorkers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			
-			for job := range jobChan {
-				if utils.IsCanceled(ctx) {
-					resultChan <- chunkResult{partseq: job.partseq, err: ctx.Err()}
-					break
-				}
-				
-				// 读取分片数据
-				byteData := make([]byte, job.size)
-				
-				fileMutex.Lock()
-				_, err := tempFile.Seek(job.offset, io.SeekStart)
-				if err != nil {
-					fileMutex.Unlock()
-					resultChan <- chunkResult{partseq: job.partseq, err: err}
-					continue
-				}
-				
-				_, err = io.ReadFull(tempFile, byteData)
-				fileMutex.Unlock()
-				
-				if err != nil && err != io.ErrUnexpectedEOF {
-					resultChan <- chunkResult{partseq: job.partseq, err: err}
-					continue
-				}
-				
-				// 准备TeraBox上传参数
-				params := map[string]string{
-					"method":     "upload",
-					"path":       path,
-					"uploadid":   precreateResp.Uploadid,
-					"app_id":     "250528",
-					"web":        "1",
-					"channel":    "dubox",
-					"clienttype": "0",
-					"partseq":    strconv.Itoa(job.partseq),
-				}
-				
-				u := "https://" + locateupload_resp.Host + "/rest/2.0/pcs/superfile2"
-				
-				// 尝试上传，带重试逻辑
-				var uploadErr error
-				for retry := 0; retry < 10; retry++ { // 10次重试，参考百度网盘实现
-					if utils.IsCanceled(ctx) {
-						resultChan <- chunkResult{partseq: job.partseq, err: ctx.Err()}
-						break
-					}
-					
-					// 上传分片
-					res, err := base.RestyClient.R().
-						SetContext(ctx).
-						SetQueryParams(params).
-						SetFileReader("file", stream.GetName(), driver.NewLimitedUploadStream(ctx, bytes.NewReader(byteData))).
-						SetHeader("Cookie", d.Cookie).
-						Post(u)
-					
-					if err == nil && res.StatusCode() >= 200 && res.StatusCode() < 300 {
-						// 检查响应中的错误码 - 使用TeraBox的错误码格式
-						errno := utils.Json.Get(res.Body(), "errno").ToInt()
-						if errno == 0 {
-							log.Debugf("Chunk %d uploaded successfully on attempt %d", job.partseq, retry+1)
-							uploadErr = nil
-							break
-						} else {
-							uploadErr = fmt.Errorf("error in uploading to terabox, errno=%d", errno)
-						}
-					} else if err != nil {
-						uploadErr = err
-					} else {
-						uploadErr = fmt.Errorf("status code: %d", res.StatusCode())
-					}
-					
-					log.Debugf("Chunk %d upload attempt %d failed: %v. Retrying after 1 second...", job.partseq, retry+1, uploadErr)
-					time.Sleep(1 * time.Second)
-				}
-				
-				resultChan <- chunkResult{partseq: job.partseq, err: uploadErr}
-			}
-		}()
-	}
-	
-	// 分发任务
-	for partseq := 0; partseq < count; partseq++ {
-		offset := int64(partseq) * chunkSize
-		size := chunkSize
-		if offset+size > streamSize {
-			size = streamSize - offset
-		}
-		
-		jobChan <- chunkJob{
-			partseq: partseq,
-			offset:  offset,
-			size:    size,
-		}
-	}
-	
-	close(jobChan)
-	
-	go func() {
-		wg.Wait()
-		close(resultChan)
-	}()
-	
-	// 收集结果
-	completedChunks := 0
-	var firstError error
-	
-	for result := range resultChan {
-		if result.err != nil {
-			if firstError == nil {
-				firstError = result.err
-			}
-			log.Errorf("Chunk %d upload failed: %v", result.partseq, result.err)
-		} else {
-			completedChunks++
-			
-			// 更新进度
-			if count > 0 {
-				up(float64(completedChunks) * 100 / float64(count))
-			}
-		}
-	}
-	
-	if firstError != nil {
-		return firstError
-	}
-	
-	// 6. 创建文件 - 使用TeraBox的API路径和参数
+
 	params := map[string]string{
-		"isdir": "0",
-		"rtype": "1", // 1: 重命名冲突文件
+		"method":     "upload",
+		"path":       path,
+		"uploadid":   precreateResp.Uploadid,
+		"app_id":     "250528",
+		"web":        "1",
+		"channel":    "dubox",
+		"clienttype": "0",
 	}
-	
+
+	streamSize := stream.GetSize()
+	chunkSize := calculateChunkSize(streamSize)
+	chunkByteData := make([]byte, chunkSize)
+	count := int(math.Ceil(float64(streamSize) / float64(chunkSize)))
+	left := streamSize
+	uploadBlockList := make([]string, 0, count)
+	h := md5.New()
+	for partseq := 0; partseq < count; partseq++ {
+		if utils.IsCanceled(ctx) {
+			return ctx.Err()
+		}
+		byteSize := chunkSize
+		var byteData []byte
+		if left >= chunkSize {
+			byteData = chunkByteData
+		} else {
+			byteSize = left
+			byteData = make([]byte, byteSize)
+		}
+		left -= byteSize
+		_, err = io.ReadFull(tempFile, byteData)
+		if err != nil {
+			return err
+		}
+
+		// calculate md5
+		h.Write(byteData)
+		uploadBlockList = append(uploadBlockList, hex.EncodeToString(h.Sum(nil)))
+		h.Reset()
+
+		u := "https://" + locateupload_resp.Host + "/rest/2.0/pcs/superfile2"
+		params["partseq"] = strconv.Itoa(partseq)
+		res, err := base.RestyClient.R().
+			SetContext(ctx).
+			SetQueryParams(params).
+			SetFileReader("file", stream.GetName(), driver.NewLimitedUploadStream(ctx, bytes.NewReader(byteData))).
+			SetHeader("Cookie", d.Cookie).
+			Post(u)
+		if err != nil {
+			return err
+		}
+		log.Debugln(res.String())
+		if count > 0 {
+			up(float64(partseq) * 100 / float64(count))
+		}
+	}
+
+	// create file
+	params = map[string]string{
+		"isdir": "0",
+		"rtype": "1",
+	}
+
+	uploadBlockListStr, err := utils.Json.MarshalToString(uploadBlockList)
+	if err != nil {
+		return err
+	}
 	data = map[string]string{
 		"path":        rawPath,
 		"size":        strconv.FormatInt(stream.GetSize(), 10),
 		"uploadid":    precreateResp.Uploadid,
 		"target_path": dstDir.GetPath(),
-		"block_list":  blockListStr, // 使用预计算的MD5列表
+		"block_list":  uploadBlockListStr,
 		"local_mtime": strconv.FormatInt(stream.ModTime().Unix(), 10),
 	}
-	
-	// 添加重试逻辑
 	var createResp CreateResp
-	var createErr error
-	for retry := 0; retry < 5; retry++ {
-		if utils.IsCanceled(ctx) {
-			return ctx.Err()
-		}
-		
-		res, err = d.post_form("/api/create", params, data, &createResp)
-		if err != nil {
-			createErr = err
-			log.Debugf("Create file attempt %d failed with error: %v. Retrying in 2 seconds...", retry+1, err)
-			time.Sleep(2 * time.Second)
-			continue
-		}
-		
-		log.Debugln(string(res))
-		
-		if createResp.Errno == 0 {
-			return nil
-		} else {
-			if retry == 0 {
-				data["mode"] = "1" // 手动上传模式
-				log.Debugf("Retrying with mode=1 added")
-			} else if retry == 1 {
-				params["rtype"] = "3" // 覆盖同名文件
-				log.Debugf("Retrying with rtype=3 (overwrite)")
-			} else if retry == 2 {
-				data["path"] = encodeURIComponent(rawPath)
-				log.Debugf("Retrying with URL-encoded path: %s", data["path"])
-			}
-			
-			createErr = fmt.Errorf("[terabox] failed to create file, errno: %d, attempt %d", createResp.Errno, retry+1)
-			log.Debugf("%v. Retrying in 2 seconds...", createErr)
-			time.Sleep(2 * time.Second)
-		}
+	res, err = d.post_form("/api/create", params, data, &createResp)
+	log.Debugln(string(res))
+	if err != nil {
+		return err
 	}
-	
-	return createErr
+	if createResp.Errno != 0 {
+		return fmt.Errorf("[terabox] failed to create file, errno: %d", createResp.Errno)
+	}
+	return nil
 }
 
 var _ driver.Driver = (*Terabox)(nil)
