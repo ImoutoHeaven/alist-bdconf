@@ -208,8 +208,8 @@ func (d *Terabox) Put(ctx context.Context, dstDir model.Obj, stream model.FileSt
 	// Create a waitgroup to wait for all workers to finish
 	var wg sync.WaitGroup
 	
-	// Create worker pool (up to 100 workers)
-	numWorkers := 100
+	// Create worker pool (up to 16 workers)
+	numWorkers := 16
 	if count < numWorkers {
 		numWorkers = count
 	}
