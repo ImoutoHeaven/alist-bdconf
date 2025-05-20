@@ -11,14 +11,11 @@ import (
 	stdpath "path"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/alist-org/alist/v3/drivers/base"
 	"github.com/alist-org/alist/v3/pkg/utils"
 	log "github.com/sirupsen/logrus"
-	"golang.org/x/sync/errgroup"
-	"golang.org/x/sync/semaphore"
 
 	"github.com/alist-org/alist/v3/internal/driver"
 	"github.com/alist-org/alist/v3/internal/model"
@@ -182,69 +179,80 @@ func (d *Terabox) Put(ctx context.Context, dstDir model.Obj, stream model.FileSt
 		return nil
 	}
 
-	// 缓存完整文件
+	// Enhanced chunk upload with parallelism and retry logic
 	tempFile, err := stream.CacheFullInTempFile()
 	if err != nil {
 		return err
 	}
-
-	// 基本参数设置
+	
 	streamSize := stream.GetSize()
 	chunkSize := calculateChunkSize(streamSize)
 	count := int(math.Ceil(float64(streamSize) / float64(chunkSize)))
-
-	// 准备并发上传
-	uploadBlockList := make([]string, count)
-	uploadedChunks := make([]int32, count)
 	
-	// 创建错误组和并发控制
-	eg, uploadCtx := errgroup.WithContext(ctx)
-	sem := semaphore.NewWeighted(100) // 设置100并发
+	// Create channels for job distribution and result collection
+	type chunkJob struct {
+		partseq int
+		offset  int64
+		size    int64
+	}
 	
-	// 计算最终的MD5列表互斥锁
-	var blockListMutex sync.Mutex
+	type chunkResult struct {
+		partseq int
+		md5sum  string
+		err     error
+	}
 	
-	// 启动并发上传任务
-	for partseq := 0; partseq < count; partseq++ {
-		if utils.IsCanceled(uploadCtx) {
-			return uploadCtx.Err()
-		}
-		
-		partseq := partseq // 创建本地变量避免闭包问题
-		offset := int64(partseq) * chunkSize
-		size := chunkSize
-		if partseq == count-1 && streamSize%chunkSize != 0 {
-			size = streamSize % chunkSize
-		}
-		
-		eg.Go(func() error {
-			// 获取并发信号量
-			if err := sem.Acquire(uploadCtx, 1); err != nil {
-				return err
-			}
-			defer sem.Release(1)
+	jobChan := make(chan chunkJob, count)
+	resultChan := make(chan chunkResult, count)
+	
+	// Create a waitgroup to wait for all workers to finish
+	var wg sync.WaitGroup
+	
+	// Create worker pool (up to 100 workers)
+	numWorkers := 100
+	if count < numWorkers {
+		numWorkers = count
+	}
+	
+	// Start workers
+	fileMutex := &sync.Mutex{} // Mutex to synchronize file access
+	
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
 			
-			// 添加重试逻辑
-			var uploadErr error
-			for attempt := 0; attempt < 10; attempt++ { // 最多重试10次
-				if utils.IsCanceled(uploadCtx) {
-					return uploadCtx.Err()
+			for job := range jobChan {
+				if utils.IsCanceled(ctx) {
+					resultChan <- chunkResult{partseq: job.partseq, err: ctx.Err()}
+					break // Exit loop on context cancellation
 				}
 				
-				// 读取分块数据
-				byteData := make([]byte, size)
-				_, err := tempFile.ReadAt(byteData, offset)
-				if err != nil && err != io.EOF {
-					return err
+				// Read chunk data with mutex protection
+				byteData := make([]byte, job.size)
+				
+				fileMutex.Lock()
+				_, err := tempFile.Seek(job.offset, io.SeekStart)
+				if err != nil {
+					fileMutex.Unlock()
+					resultChan <- chunkResult{partseq: job.partseq, err: err}
+					continue
 				}
 				
-				// 计算MD5
+				_, err = io.ReadFull(tempFile, byteData)
+				fileMutex.Unlock()
+				
+				if err != nil {
+					resultChan <- chunkResult{partseq: job.partseq, err: err}
+					continue
+				}
+				
+				// Calculate MD5
 				h := md5.New()
 				h.Write(byteData)
 				md5sum := hex.EncodeToString(h.Sum(nil))
 				
-				// 设置上传参数
-				u := "https://" + locateupload_resp.Host + "/rest/2.0/pcs/superfile2"
+				// Prepare parameters for this chunk
 				params := map[string]string{
 					"method":     "upload",
 					"path":       path,
@@ -253,66 +261,116 @@ func (d *Terabox) Put(ctx context.Context, dstDir model.Obj, stream model.FileSt
 					"web":        "1",
 					"channel":    "dubox",
 					"clienttype": "0",
-					"partseq":    strconv.Itoa(partseq),
+					"partseq":    strconv.Itoa(job.partseq),
 				}
 				
-				// 执行上传
-				res, err := base.RestyClient.R().
-					SetContext(uploadCtx).
-					SetQueryParams(params).
-					SetFileReader("file", stream.GetName(), driver.NewLimitedUploadStream(uploadCtx, bytes.NewReader(byteData))).
-					SetHeader("Cookie", d.Cookie).
-					Post(u)
+				u := "https://" + locateupload_resp.Host + "/rest/2.0/pcs/superfile2"
 				
-				if err == nil {
-					log.Debugln("分块上传响应:", res.String())
-					// 检查响应状态
-					statusCode := res.StatusCode()
-					errNo := utils.Json.Get(res.Body(), "errno").ToInt()
-					
-					if statusCode == 200 && (errNo == 0 || errNo == 9 || res.String() == "") {
-						// 上传成功
-						atomic.StoreInt32(&uploadedChunks[partseq], 1)
-						
-						// 更新MD5列表
-						blockListMutex.Lock()
-						uploadBlockList[partseq] = md5sum
-						blockListMutex.Unlock()
-						
-						// 更新进度
-						completedChunks := 0
-						for i := 0; i < count; i++ {
-							if atomic.LoadInt32(&uploadedChunks[i]) == 1 {
-								completedChunks++
-							}
-						}
-						up(float64(completedChunks) * 100 / float64(count))
-						
-						return nil // 成功退出重试循环
+				// Try uploading with retries
+				var uploadErr error
+				for retry := 0; retry < 10; retry++ {
+					if utils.IsCanceled(ctx) {
+						resultChan <- chunkResult{partseq: job.partseq, err: ctx.Err()}
+						break
 					}
 					
-					uploadErr = fmt.Errorf("块%d上传失败(尝试%d/10), errno: %d, 响应: %s", 
-						partseq, attempt+1, errNo, res.String())
-				} else {
-					uploadErr = fmt.Errorf("块%d上传失败(尝试%d/10): %v", 
-						partseq, attempt+1, err)
+					// Upload the chunk
+					res, err := base.RestyClient.R().
+						SetContext(ctx).
+						SetQueryParams(params).
+						SetFileReader("file", stream.GetName(), driver.NewLimitedUploadStream(ctx, bytes.NewReader(byteData))).
+						SetHeader("Cookie", d.Cookie).
+						Post(u)
+					
+					if err == nil {
+						// Check if the response indicates success
+						respBody := res.Body()
+						var respJson map[string]interface{}
+						if err := utils.Json.Unmarshal(respBody, &respJson); err == nil {
+							if errno, ok := respJson["errno"].(float64); ok && errno == 0 {
+								// Upload successful
+								log.Debugf("Chunk %d uploaded successfully on attempt %d", job.partseq, retry+1)
+								uploadErr = nil
+								break
+							} else {
+								uploadErr = fmt.Errorf("chunk upload failed with errno: %.0f", errno)
+							}
+						} else {
+							uploadErr = fmt.Errorf("failed to parse response: %s", string(respBody))
+						}
+					} else {
+						uploadErr = err
+					}
+					
+					// If we get here, the upload failed
+					log.Debugf("Chunk %d upload attempt %d failed: %v. Retrying after 1 second...", job.partseq, retry+1, uploadErr)
+					
+					// Sleep before retrying
+					time.Sleep(1 * time.Second)
 				}
 				
-				// 失败则休眠后重试
-				log.Debugf("%v", uploadErr)
-				time.Sleep(time.Second)
+				// Send the result
+				if uploadErr != nil {
+					resultChan <- chunkResult{partseq: job.partseq, err: fmt.Errorf("failed to upload chunk %d after 10 retries: %w", job.partseq, uploadErr)}
+				} else {
+					resultChan <- chunkResult{partseq: job.partseq, md5sum: md5sum, err: nil}
+				}
 			}
-			
-			return uploadErr // 返回最后一次尝试的错误
-		})
+		}()
 	}
 	
-	// 等待所有上传任务完成
-	if err := eg.Wait(); err != nil {
-		return err
+	// Queue jobs
+	for partseq := 0; partseq < count; partseq++ {
+		offset := int64(partseq) * chunkSize
+		size := chunkSize
+		if offset+size > streamSize {
+			size = streamSize - offset
+		}
+		
+		jobChan <- chunkJob{
+			partseq: partseq,
+			offset:  offset,
+			size:    size,
+		}
 	}
-
-	// 创建文件
+	
+	// Close the job channel to signal workers to exit
+	close(jobChan)
+	
+	// Start a goroutine to close the result channel when all workers are done
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+	
+	// Collect results and handle errors
+	uploadBlockList := make([]string, count)
+	completedChunks := 0
+	var firstError error
+	
+	for result := range resultChan {
+		if result.err != nil {
+			if firstError == nil {
+				firstError = result.err
+			}
+			log.Errorf("Chunk %d upload failed: %v", result.partseq, result.err)
+		} else {
+			uploadBlockList[result.partseq] = result.md5sum
+			completedChunks++
+			
+			// Update progress
+			if count > 0 {
+				up(float64(completedChunks) * 100 / float64(count))
+			}
+		}
+	}
+	
+	// Check if any chunk failed
+	if firstError != nil {
+		return firstError
+	}
+	
+	// Create file (existing code)
 	params := map[string]string{
 		"isdir": "0",
 		"rtype": "1",
@@ -322,7 +380,6 @@ func (d *Terabox) Put(ctx context.Context, dstDir model.Obj, stream model.FileSt
 	if err != nil {
 		return err
 	}
-	
 	data = map[string]string{
 		"path":        rawPath,
 		"size":        strconv.FormatInt(stream.GetSize(), 10),
