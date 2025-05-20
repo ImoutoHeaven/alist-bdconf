@@ -208,8 +208,8 @@ func (d *Terabox) Put(ctx context.Context, dstDir model.Obj, stream model.FileSt
 	// Create a waitgroup to wait for all workers to finish
 	var wg sync.WaitGroup
 	
-	// Create worker pool (up to 16 workers)
-	numWorkers := 16
+	// Create worker pool (up to 32 workers)
+	numWorkers := 32
 	if count < numWorkers {
 		numWorkers = count
 	}
@@ -286,16 +286,42 @@ func (d *Terabox) Put(ctx context.Context, dstDir model.Obj, stream model.FileSt
 						// Check if the response indicates success
 						respBody := res.Body()
 						var respJson map[string]interface{}
+						
+						// 针对特殊情况：如果响应是空的或非常短，通常也表示成功
+						if len(respBody) < 5 {
+							log.Debugf("Chunk %d uploaded successfully on attempt %d (empty response)", job.partseq, retry+1)
+							uploadErr = nil
+							break
+						}
+						
 						if err := utils.Json.Unmarshal(respBody, &respJson); err == nil {
-							if errno, ok := respJson["errno"].(float64); ok && errno == 0 {
-								// Upload successful
+							// 获取errno，如果没有或解析失败，默认视为成功
+							errno, ok := respJson["errno"].(float64)
+							if !ok {
+								// 如果无法获取errno字段，可能是响应格式不同，尝试检查HTTP状态码
+								if res.StatusCode() >= 200 && res.StatusCode() < 300 {
+									log.Debugf("Chunk %d uploaded successfully on attempt %d (status code: %d)", job.partseq, retry+1, res.StatusCode())
+									uploadErr = nil
+									break
+								} else {
+									uploadErr = fmt.Errorf("chunk upload failed with status code: %d", res.StatusCode())
+								}
+							} else if errno == 0 {
+								// Upload successful with errno 0
 								log.Debugf("Chunk %d uploaded successfully on attempt %d", job.partseq, retry+1)
 								uploadErr = nil
 								break
 							} else {
+								// 真正的错误，errno不为0
 								uploadErr = fmt.Errorf("chunk upload failed with errno: %.0f", errno)
 							}
 						} else {
+							// 如果JSON解析失败但HTTP状态码成功，也视为成功
+							if res.StatusCode() >= 200 && res.StatusCode() < 300 {
+								log.Debugf("Chunk %d uploaded successfully on attempt %d (non-JSON response)", job.partseq, retry+1)
+								uploadErr = nil
+								break
+							}
 							uploadErr = fmt.Errorf("failed to parse response: %s", string(respBody))
 						}
 					} else {
