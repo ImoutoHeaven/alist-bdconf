@@ -3,8 +3,6 @@ package terabox
 import (
 	"bytes"
 	"context"
-	"crypto/md5"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"math"
@@ -131,7 +129,6 @@ func (d *Terabox) Remove(ctx context.Context, obj model.Obj) error {
 }
 
 func (d *Terabox) Put(ctx context.Context, dstDir model.Obj, stream model.FileStreamer, up driver.UpdateProgress) error {
-	// 1. 定位上传服务器
 	resp, err := base.RestyClient.R().
 		SetContext(ctx).
 		Get("https://" + d.url_domain_prefix + "-data.terabox.com/rest/2.0/pcs/file?method=locateupload")
@@ -146,7 +143,7 @@ func (d *Terabox) Put(ctx context.Context, dstDir model.Obj, stream model.FileSt
 	}
 	log.Debugln(locateupload_resp)
 
-	// 2. 预创建文件
+	// precreate file
 	rawPath := stdpath.Join(dstDir.GetPath(), stream.GetName())
 	path := encodeURIComponent(rawPath)
 
@@ -180,7 +177,7 @@ func (d *Terabox) Put(ctx context.Context, dstDir model.Obj, stream model.FileSt
 		return nil
 	}
 
-	// 3. 并行上传分片
+	// Enhanced chunk upload with parallelism and retry logic
 	tempFile, err := stream.CacheFullInTempFile()
 	if err != nil {
 		return err
@@ -190,7 +187,7 @@ func (d *Terabox) Put(ctx context.Context, dstDir model.Obj, stream model.FileSt
 	chunkSize := calculateChunkSize(streamSize)
 	count := int(math.Ceil(float64(streamSize) / float64(chunkSize)))
 	
-	// 创建通道和等待组
+	// Create channels for job distribution and result collection
 	type chunkJob struct {
 		partseq int
 		offset  int64
@@ -199,24 +196,25 @@ func (d *Terabox) Put(ctx context.Context, dstDir model.Obj, stream model.FileSt
 	
 	type chunkResult struct {
 		partseq int
-		md5sum  string
+		md5sum  string // 服务器返回的MD5
 		err     error
 	}
 	
 	jobChan := make(chan chunkJob, count)
 	resultChan := make(chan chunkResult, count)
 	
+	// Create a waitgroup to wait for all workers to finish
 	var wg sync.WaitGroup
 	
-	// 创建worker池
-	numWorkers := 10  // 降低并发数，避免可能的服务器限制
+	// Create worker pool (保持高并行度)
+	numWorkers := 50 
 	if count < numWorkers {
 		numWorkers = count
 	}
 	
-	fileMutex := &sync.Mutex{}
+	// Start workers
+	fileMutex := &sync.Mutex{} // Mutex to synchronize file access
 	
-	// 启动workers
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
 		go func() {
@@ -225,10 +223,10 @@ func (d *Terabox) Put(ctx context.Context, dstDir model.Obj, stream model.FileSt
 			for job := range jobChan {
 				if utils.IsCanceled(ctx) {
 					resultChan <- chunkResult{partseq: job.partseq, err: ctx.Err()}
-					break
+					break // Exit loop on context cancellation
 				}
 				
-				// 读取分片数据
+				// Read chunk data with mutex protection
 				byteData := make([]byte, job.size)
 				
 				fileMutex.Lock()
@@ -247,12 +245,7 @@ func (d *Terabox) Put(ctx context.Context, dstDir model.Obj, stream model.FileSt
 					continue
 				}
 				
-				// 计算MD5 - 与原始代码一致
-				h := md5.New()
-				h.Write(byteData)
-				md5sum := hex.EncodeToString(h.Sum(nil))
-				
-				// 关键点：使用与原始代码一致的partseq策略
+				// Prepare parameters for this chunk
 				params := map[string]string{
 					"method":     "upload",
 					"path":       path,
@@ -261,20 +254,22 @@ func (d *Terabox) Put(ctx context.Context, dstDir model.Obj, stream model.FileSt
 					"web":        "1",
 					"channel":    "dubox",
 					"clienttype": "0",
-					"partseq":    strconv.Itoa(job.partseq),  // 使用job.partseq
+					"partseq":    strconv.Itoa(job.partseq),
 				}
 				
 				u := "https://" + locateupload_resp.Host + "/rest/2.0/pcs/superfile2"
 				
-				// 上传分片，含重试逻辑
+				// Try uploading with retries - 最多重试10次以确保获取服务器MD5
 				var uploadErr error
-				for retry := 0; retry < 5; retry++ {
+				var serverMd5 string
+				
+				for retry := 0; retry < 10; retry++ {
 					if utils.IsCanceled(ctx) {
 						resultChan <- chunkResult{partseq: job.partseq, err: ctx.Err()}
 						break
 					}
 					
-					// 上传分片
+					// Upload the chunk
 					res, err := base.RestyClient.R().
 						SetContext(ctx).
 						SetQueryParams(params).
@@ -283,53 +278,70 @@ func (d *Terabox) Put(ctx context.Context, dstDir model.Obj, stream model.FileSt
 						Post(u)
 					
 					if err == nil && res.StatusCode() >= 200 && res.StatusCode() < 300 {
-						log.Debugf("Chunk %d uploaded successfully on attempt %d", job.partseq, retry+1)
-						uploadErr = nil
-						break
+						// 解析响应获取服务器返回的MD5
+						var respJson map[string]interface{}
+						if err := utils.Json.Unmarshal(res.Body(), &respJson); err == nil {
+							if md5, ok := respJson["md5"].(string); ok && md5 != "" {
+								serverMd5 = md5
+								log.Debugf("Server returned MD5 for chunk %d: %s", job.partseq, serverMd5)
+								uploadErr = nil
+								break // 成功获取MD5，退出重试循环
+							}
+						}
+						
+						// 如果没有从响应获取到MD5，重试
+						log.Debugf("No MD5 returned from server for chunk %d, retrying %d/10", job.partseq, retry+1)
+						uploadErr = fmt.Errorf("server did not return MD5 for chunk %d", job.partseq)
+						time.Sleep(1 * time.Second)
 					} else if err != nil {
 						uploadErr = err
+						log.Debugf("Chunk %d upload attempt %d failed with network error: %v. Retrying...", job.partseq, retry+1, err)
+						time.Sleep(1 * time.Second)
 					} else {
 						uploadErr = fmt.Errorf("status code: %d", res.StatusCode())
+						log.Debugf("Chunk %d upload attempt %d failed with status code: %d. Retrying...", job.partseq, retry+1, res.StatusCode())
+						time.Sleep(1 * time.Second)
 					}
-					
-					log.Debugf("Chunk %d upload attempt %d failed: %v. Retrying...", job.partseq, retry+1, uploadErr)
-					time.Sleep(1 * time.Second)
 				}
 				
-				if uploadErr != nil {
-					resultChan <- chunkResult{partseq: job.partseq, err: uploadErr}
+				if uploadErr != nil || serverMd5 == "" {
+					// 如果10次重试后仍然没有获得服务器MD5，报告失败
+					resultChan <- chunkResult{
+						partseq: job.partseq, 
+						err: fmt.Errorf("failed to upload chunk %d after 10 retries or server did not return MD5: %v", job.partseq, uploadErr),
+					}
 				} else {
-					resultChan <- chunkResult{partseq: job.partseq, md5sum: md5sum, err: nil}
+					resultChan <- chunkResult{partseq: job.partseq, md5sum: serverMd5, err: nil}
 				}
 			}
 		}()
 	}
 	
-	// 分发任务 - 使用简单的从0开始的序列作为partseq
+	// Queue jobs - 按顺序进行分发
 	for partseq := 0; partseq < count; partseq++ {
 		offset := int64(partseq) * chunkSize
 		size := chunkSize
-		
-		// 调整最后一个分片的大小
-		if partseq == count-1 || offset+size > streamSize {
+		if offset+size > streamSize {
 			size = streamSize - offset
 		}
 		
 		jobChan <- chunkJob{
-			partseq: partseq,  // 简单使用索引作为partseq，与原始代码一致
+			partseq: partseq,
 			offset:  offset,
 			size:    size,
 		}
 	}
 	
+	// Close the job channel to signal workers to exit
 	close(jobChan)
 	
+	// Start a goroutine to close the result channel when all workers are done
 	go func() {
 		wg.Wait()
 		close(resultChan)
 	}()
 	
-	// 收集结果并按顺序保存MD5值
+	// 按分片顺序收集MD5值，确保block_list顺序正确
 	uploadBlockList := make([]string, count)
 	completedChunks := 0
 	var firstError error
@@ -341,24 +353,33 @@ func (d *Terabox) Put(ctx context.Context, dstDir model.Obj, stream model.FileSt
 			}
 			log.Errorf("Chunk %d upload failed: %v", result.partseq, result.err)
 		} else {
-			uploadBlockList[result.partseq] = result.md5sum  // 将MD5保存在正确的位置
+			// 关键点：确保MD5值保存在正确的位置，与partseq对应
+			uploadBlockList[result.partseq] = result.md5sum
 			completedChunks++
 			
-			// 更新进度
+			// Update progress
 			if count > 0 {
 				up(float64(completedChunks) * 100 / float64(count))
 			}
 		}
 	}
 	
+	// Check if any chunk failed
 	if firstError != nil {
 		return firstError
 	}
 	
-	// 4. 创建文件 - 关键点：与原始代码保持一致，使用实际上传的MD5值
+	// 确保所有分片都有MD5值
+	for i, md5sum := range uploadBlockList {
+		if md5sum == "" {
+			return fmt.Errorf("[terabox] missing server MD5 for chunk %d", i)
+		}
+	}
+	
+	// 创建文件 - 使用服务器返回的MD5值，以正确的顺序排列
 	params := map[string]string{
 		"isdir": "0",
-		"rtype": "1",
+		"rtype": "1", // 1: Rename if there is any path conflict
 	}
 
 	// 将MD5列表转为JSON字符串
@@ -367,17 +388,16 @@ func (d *Terabox) Put(ctx context.Context, dstDir model.Obj, stream model.FileSt
 		return err
 	}
 	
-	// 使用与原始代码相同的参数
 	data = map[string]string{
 		"path":        rawPath,
 		"size":        strconv.FormatInt(stream.GetSize(), 10),
 		"uploadid":    precreateResp.Uploadid,
 		"target_path": dstDir.GetPath(),
-		"block_list":  uploadBlockListStr,  // 使用实际计算的MD5值列表
+		"block_list":  uploadBlockListStr,  // 使用按顺序排列的服务器MD5列表
 		"local_mtime": strconv.FormatInt(stream.ModTime().Unix(), 10),
 	}
 	
-	// 添加重试逻辑
+	// 添加重试逻辑，最多尝试5次创建文件
 	var createResp CreateResp
 	var createErr error
 	for retry := 0; retry < 5; retry++ {
@@ -396,25 +416,22 @@ func (d *Terabox) Put(ctx context.Context, dstDir model.Obj, stream model.FileSt
 		log.Debugln(string(res))
 		
 		if createResp.Errno == 0 {
+			// 创建成功
 			return nil
 		} else {
-			// 尝试不同的修复策略
+			// 根据错误码尝试不同的修复策略
 			if retry == 0 {
-				// 第一次失败后，尝试添加额外参数
-				data["target_path"] = dstDir.GetPath()
-				log.Debugf("Retrying with target_path added: %s", data["target_path"])
+				// 尝试添加mode参数 (根据API文档)
+				data["mode"] = "1" // 手动上传模式
+				log.Debugf("Retrying with mode=1 added")
 			} else if retry == 1 {
-				// 第二次失败后，尝试使用URL编码的路径
-				data["path"] = encodeURIComponent(rawPath)
-				log.Debugf("Retrying with URL-encoded path: %s", data["path"])
-			} else if retry == 2 {
-				// 第三次失败后，尝试更改重命名策略
+				// 尝试调整rtype
 				params["rtype"] = "3" // 覆盖同名文件
 				log.Debugf("Retrying with rtype=3 (overwrite)")
-			} else if retry == 3 {
-				// 第四次失败，尝试使用原始预创建的block_list
-				data["block_list"] = precreateBlockListStr
-				log.Debugf("Retrying with original precreate block_list")
+			} else if retry == 2 {
+				// 尝试使用URL编码的路径
+				data["path"] = encodeURIComponent(rawPath)
+				log.Debugf("Retrying with URL-encoded path: %s", data["path"])
 			}
 			
 			createErr = fmt.Errorf("[terabox] failed to create file, errno: %d, attempt %d", createResp.Errno, retry+1)
@@ -423,6 +440,7 @@ func (d *Terabox) Put(ctx context.Context, dstDir model.Obj, stream model.FileSt
 		}
 	}
 	
+	// 所有重试都失败
 	return createErr
 }
 
